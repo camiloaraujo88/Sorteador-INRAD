@@ -1,0 +1,1 @@
+pyinstaller --onefile --windowed --name "Sorteador-INRAD-2025" --add-data "audio/*.mp3:." --hidden-import=pandas --hidden-import=openpyxl --hidden-import=pygame Sorteador-INRAD-2025.py
