@@ -6,6 +6,7 @@ from datetime import datetime
 import os
 from pygame import mixer
 import openpyxl
+import re
 
 # Inicializa o Pygame e o mixer de áudio
 pygame.init()
@@ -72,7 +73,7 @@ AUDIO_FILES = {
     'moveyourfeet': 'moveyourfeet.mp3',
     'labamba': 'labamba.mp3',
     'mexe': 'mexe.mp3',
-    'balaio': 'balaio.mp3',
+    'porto': 'porto.mp3',
     'musicaepica': 'musicaepica.mp3',
     'snoop': 'snoop.mp3',
     'suspense2': 'suspense2.mp3',
@@ -128,7 +129,7 @@ def carregar_audios():
     # CORREÇÃO: Usando o método simplificado para evitar erros de sintaxe
     audios_sorteio = []
     for nome in ['tambor', 'banheira', 'piao', 'carlton', 'moveyourfeet', 
-                 'labamba', 'mexe', 'balaio', 'musicaepica', 'snoop', 
+                 'labamba', 'mexe', 'porto', 'musicaepica', 'snoop', 
                  'suspense2', 'genius', 'gta', 'need', 'macarena']:
         audios_sorteio.append(audios.get(nome))
     
@@ -342,6 +343,63 @@ def salvar_log_sorteio(participante):
         print(f"✗ Erro ao salvar log: {e}")
         return False
 
+def ler_log_sorteios():
+    """Lê o arquivo de log, coleta IDs distintos, categorias (com repetições)
+    e a data/hora da última linha válida.
+
+    Retorna uma tupla (ids_sorteados_log, categorias_log, data_ultimo_sorteio_log)
+    ou None se não houver dados válidos ou se ocorrer algum erro.
+    """
+    try:
+        if not os.path.exists(CAMINHO_LOG):
+            return None
+
+        # Regex para linhas no formato:
+        # 16/12/2025 14:38:55 | Categoria: TERCEIROS | ID: 1014 | Nome: Fulano
+        padrao = re.compile(
+            r"^(?P<data>\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}) \| Categoria: (?P<categoria>.+?) \| ID: (?P<id>[^|\n\r]+) \| Nome: (?P<nome>.+)$"
+        )
+
+        ids_distintos = []  # manter ordem de aparição, sem repetir
+        ids_set = set()
+        categorias = []  # com repetições, na ordem
+        ultima_datahora = None
+
+        with open(CAMINHO_LOG, 'r', encoding='utf-8') as f:
+            for linha in f:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                m = padrao.match(linha)
+                if not m:
+                    # ignora linhas não conformes
+                    continue
+                data_str = m.group('data')
+                categoria = m.group('categoria').strip()
+                id_val = m.group('id').strip()
+
+                # Atualiza coleções
+                categorias.append(categoria)
+                if id_val not in ids_set:
+                    ids_set.add(id_val)
+                    ids_distintos.append(id_val)
+
+                ultima_datahora = data_str  # sendo a última linha válida, fica por último
+
+        if not ids_distintos or ultima_datahora is None:
+            return None
+
+        qtd = len(ids_distintos)
+        # Validação: fazer nada se >31, <1 ou nulo
+        if qtd > 31 or qtd < 1:
+            return None
+
+        return ids_distintos, categorias, ultima_datahora
+
+    except Exception as e:
+        print(f"✗ Erro ao ler log: {e}")
+        return None
+
 class Botao:
     def __init__(self, x, y, largura, altura, texto, cor_normal=COR_BOTAO):
         self.rect = pygame.Rect(x, y, largura, altura)
@@ -374,7 +432,6 @@ class Sorteador:
         self.participantes = carregar_dados_excel()
         self.sorteando = False
         self.participante_sorteado = None
-        self.historico = []
         self.tempo_sorteio = 0
         self.velocidade_sorteio = 30
         self.tempo_finalizacao = 0
@@ -392,6 +449,36 @@ class Sorteador:
         self.categorias_pool_backup = list(categorias_participantes)  # cópia imutável da configuração inicial
         self.categorias_pool = None  # será inicializada no primeiro sorteio
         
+        # Tentativa de restaurar estado a partir do log (se existir e for válido)
+        dados_log = ler_log_sorteios()
+        if dados_log:
+            ids_sorteados_log, categorias_log, data_ultimo_sorteio_log = dados_log
+            try:
+                # 1) contador de sorteios = total de IDs distintos
+                self.contador_sorteios = len(ids_sorteados_log)
+
+                # 2) remover do pool as ocorrências de categorias já registradas no log
+                if self.categorias_pool is None:
+                    self.categorias_pool = list(self.categorias_pool_backup)
+                for cat in categorias_log:
+                    # remove uma ocorrência por vez, se houver no pool
+                    if self.categorias_pool and cat in self.categorias_pool:
+                        try:
+                            self.categorias_pool.remove(cat)
+                        except ValueError:
+                            pass
+
+                # 3) adicionar IDs sorteados no set de bloqueio
+                for _id in ids_sorteados_log:
+                    self.participantes_sorteados_ids.add(_id)
+
+                # 4) último sorteio (usar data/hora completa do log)
+                self.ultimo_sorteio = data_ultimo_sorteio_log
+
+                print(f"↩ Estado restaurado do log: {self.contador_sorteios} sorteios, {len(self.participantes_sorteados_ids)} IDs bloqueados")
+            except Exception as e:
+                print(f"⚠ Não foi possível restaurar completamente o estado do log: {e}")
+
         self.atualizar_botoes()
         
     def atualizar_botoes(self):
@@ -530,7 +617,6 @@ class Sorteador:
         self.participante_sorteado = self.sortear_participante()
         
         if self.participante_sorteado:
-            self.historico.append(self.participante_sorteado)
             salvar_log_sorteio(self.participante_sorteado)
             self.ultimo_sorteio = datetime.now().strftime("%H:%M:%S")
             
@@ -567,7 +653,9 @@ class Sorteador:
             # Atualiza animação do sorteio
             if tempo_atual - self.tempo_sorteio > self.velocidade_sorteio:
                 if self.participantes:
-                    self.participante_sorteado = random.choice(self.participantes)
+                    participantes_carrossel = [p for p in self.participantes
+                                                 if p['id'] not in self.participantes_sorteados_ids]
+                    self.participante_sorteado = random.choice(participantes_carrossel)
                     self.tempo_sorteio = tempo_atual
                     
                     # Aumenta velocidade gradualmente para durar ~8 segundos
@@ -638,20 +726,11 @@ class Sorteador:
                 nome_rect = nome_surf.get_rect(center=(largura_tela//2, area_y + area_altura//2))
                 tela.blit(nome_surf, nome_rect)
 
-                # NOVO: Exibir a categoria logo abaixo do nome, centralizada e 80% menor que o texto do nome
-                # Comentários (PT-BR):
-                # - Ajustamos dinamicamente o tamanho com base no tamanho real renderizado do nome.
-                # - Risco: em telas muito pequenas, o tamanho pode ficar pequeno demais; considerar limite mínimo.
+                # NOVO: Exibir a categoria logo abaixo do nome, centralizada
                 categoria = str(self.participante_sorteado.get('categoria', '')).strip()
                 if categoria:
-                    # Calcula tamanho da fonte da categoria como 20% do tamanho do nome (80% menor)
-                    # Derivamos o tamanho aproximado do nome pelo menor lado do glyph box; fallback para 48.
-                    try:
-                        # Heurística: estimar tamanho base a partir da altura do surface do nome
-                        tamanho_nome_px = nome_surf.get_height()
-                        tamanho_categoria = max(12, int(tamanho_nome_px * 0.20))  # mínimo de 12px
-                    except Exception:
-                        tamanho_categoria = 12
+                    # Tamanho fixo para a fonte da categoria
+                    tamanho_categoria = 14
 
                     fonte_categoria = pygame.font.SysFont('arial', tamanho_categoria, bold=False)
                     categoria_surf = fonte_categoria.render(categoria, True, COR_CATEGORIA)
@@ -672,8 +751,8 @@ class Sorteador:
         stats_y = altura_tela - 120  # Subiu 40px
         stats_text = fonte_normal.render(
             f"Total: {len(self.participantes)} | "
-            f"Sorteados: {len(self.historico)} | "
-            f"Restantes: {len(self.participantes) - len(self.historico)}", 
+            f"Sorteados: {len(self.participantes_sorteados_ids)} | "
+            f"Restantes: {len(self.participantes) - len(self.participantes_sorteados_ids)}",
             True, COR_TEXTO
         )
         tela.blit(stats_text, (largura_tela//2 - stats_text.get_width()//2, stats_y))
@@ -788,7 +867,7 @@ try:
     with open(CAMINHO_LOG, 'a', encoding='utf-8') as f:
         f.write(f"\n{'='*60}\n")
         f.write(f"Sessão finalizada: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-        f.write(f"Total de sorteados: {len(sorteador.historico)}\n")
+        f.write(f"Total de sorteados: {len(sorteador.participantes_sorteados_ids)}\n")
         f.write(f"{'='*60}\n\n")
     print(f"📝 Log final salvo na área de trabalho: {CAMINHO_LOG}")
 except Exception as e:
@@ -796,7 +875,7 @@ except Exception as e:
 
 print("\n" + "="*60)
 print("👋 SORTEADOR INRAD ENCERRADO")
-print(f"🎯 Total de sorteados nesta sessão: {len(sorteador.historico)}")
+print(f"🎯 Total de sorteados nesta sessão: {len(sorteador.participantes_sorteados_ids)}")
 print(f"🔢 Sequência de áudios usada: {sorteador.contador_sorteios} sorteios")
 print("="*60 + "\n")
 
