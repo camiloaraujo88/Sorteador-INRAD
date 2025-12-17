@@ -4,8 +4,8 @@ import sys
 import pandas as pd
 from datetime import datetime
 import os
-import tempfile
 from pygame import mixer
+import openpyxl
 
 # Inicializa o Pygame e o mixer de áudio
 pygame.init()
@@ -20,6 +20,21 @@ pygame.display.set_caption("Sorteador de Confraternização")
 tela_cheia = False
 audio_ativado = True
 largura_tela, altura_tela = LARGURA, ALTURA
+
+# Lista global de categorias (com repetições conforme quantidades desejadas)
+# Comentários (PT-BR):
+# - Mantém acentuação exatamente como na planilha para casar corretamente com a chave 'categoria'.
+# - Riscos: Se houver divergências de grafia/acentuação nas categorias da planilha, pode não haver correspondência exata.
+# - Sugestão: Padronize as categorias na fonte de dados. Caso alguma categoria não exista entre os participantes,
+#   a cota ainda será consumida, o que pode alterar a distribuição real. Ajuste conforme a necessidade do evento.
+categorias_participantes = (
+    ['ADM+APOIO'] * 6 +
+    ['HRB'] * 1 +
+    ['MÉDICO'] * 4 +
+    ['MULTI'] * 11 +
+    ['RESIDENTES'] * 5 +
+    ['TERCEIROS'] * 4
+)
 
 # Obtém o caminho da área de trabalho do usuário
 CAMINHO_DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -69,8 +84,6 @@ AUDIO_FILES = {
 }
 
 # Variáveis globais para áudios
-audios_sorteio = []
-som_sucesso = None
 audio_atual_index = 0  # Índice do áudio atual na sequência
 audio_atual = None  # Áudio que está tocando atualmente
 tempo_inicio_audio = 0
@@ -126,7 +139,7 @@ def carregar_audios():
     sucesso_carregado = 1 if som_sucesso else 0
     
     print(f"\n🎵 RESUMO DE ÁUDIOS:")
-    print(f"  Áudios de sorteio carregados: {carregados}/13")
+    print(f"  Áudios de sorteio carregados: {carregados}/15")
     print(f"  Áudio de sucesso carregado: {'Sim' if som_sucesso else 'Não'}")
     print(f"  Sequência com {len(audios_sorteio)} áudios")
     
@@ -255,6 +268,12 @@ def processar_dataframe(df):
             cat = cat.strip()
             id_val = str(id_val).strip()
             nome = nome.strip()
+            # NOVO: Força o nome para MAIÚSCULAS ao carregar do dataframe (pedido do usuário)
+            # Comentários (PT-BR):
+            # - Isso padroniza a exibição dos nomes na animação e no resultado final.
+            # - Risco/Sugestão: pode aumentar a largura do texto (nomes em CAPS ocupam mais espaço);
+            #   o layout já usa texto responsivo para se ajustar, mas nomes muito longos podem reduzir o tamanho da fonte.
+            nome = nome.upper()
             
             # Pula linhas vazias
             if not nome or nome == "nan" or nome == "None":
@@ -367,6 +386,12 @@ class Sorteador:
         self.contador_sorteios = 0  # Conta quantos sorteios já foram feitos
         self.audio_sorteio_atual = None  # Áudio do sorteio atual
         
+        # Controle do pool de categorias para cumprir as cotas por rodada
+        # Comentários (PT-BR): criamos um backup fixo e um pool mutável para consumo a cada sorteio.
+        # Risco: se a planilha não tiver participantes suficientes em uma categoria para a cota, haverá fallback (ver método sortear_participante)
+        self.categorias_pool_backup = list(categorias_participantes)  # cópia imutável da configuração inicial
+        self.categorias_pool = None  # será inicializada no primeiro sorteio
+        
         self.atualizar_botoes()
         
     def atualizar_botoes(self):
@@ -381,28 +406,73 @@ class Sorteador:
         # Posição Y: mais para cima (sem a barra de progresso)
         pos_y = altura_tela - 180  # Subiu 40px
         
-        total_largura = (btn_largura * 2) + espacamento
-        inicio_x = (largura_tela - total_largura) // 2
+        # Centraliza o único botão disponível (removido o botão "NOVO SORTEIO")
+        inicio_x = (largura_tela - btn_largura) // 2  # centralizado
         
         self.botao_sortear = Botao(inicio_x, pos_y, btn_largura, btn_altura, 
-                                   "INICIAR SORTEIO", COR_BOTAO_SORTEIO)
-        self.botao_novo = Botao(inicio_x + btn_largura + espacamento, pos_y, 
-                               btn_largura, btn_altura, "NOVO SORTEIO", COR_AZUL)
+                                   "SORTEAR", COR_BOTAO_SORTEIO)
     
     def sortear_participante(self):
         """Sorteia um participante que ainda não foi sorteado"""
+        # Checagem de nulos/inconsistências na lista de participantes
         if not self.participantes:
+            # Aviso: sem participantes carregados – verifique a planilha
             return None
         
+        # Inicializa o pool de categorias na primeira execução do programa/rodada
+        if self.contador_sorteios == 0 and (self.categorias_pool is None or len(self.categorias_pool) == 0):
+            # Faz uma cópia da lista global com as repetições
+            self.categorias_pool = list(self.categorias_pool_backup)
+            # Comentário: esta cópia será consumida a cada sorteio até esvaziar
+
         participantes_disponiveis = [p for p in self.participantes 
-                                    if p['id'] not in self.participantes_sorteados_ids]
+                                     if p['id'] not in self.participantes_sorteados_ids]
         
         if not participantes_disponiveis:
             print("Todos sorteados! Reiniciando...")
             self.participantes_sorteados_ids.clear()
             participantes_disponiveis = self.participantes
         
-        sorteado = random.choice(participantes_disponiveis)
+        # Seleciona a categoria da vez a partir do pool e remove do pool
+        # Se o pool estiver vazio (fim de rodada), reinicia a partir do backup
+        if self.categorias_pool is None or len(self.categorias_pool) == 0:
+            # Comentário: reinício do pool de categorias ao completar a rodada de 31 entradas
+            self.categorias_pool = list(self.categorias_pool_backup)
+        
+        # Escolhe e consome uma categoria do pool
+        categoria_escolhida = random.choice(self.categorias_pool)
+        # Remove apenas uma ocorrência da categoria escolhida
+        try:
+            self.categorias_pool.remove(categoria_escolhida)
+        except ValueError:
+            # Comentário: improvável, mas se não encontrar, segue sem remover
+            pass
+        
+        print(f"Categoria sorteada: {categoria_escolhida}")  # debug/output da categoria
+        
+        # Filtra participantes disponíveis pela categoria escolhida
+        candidatos_categoria = [p for p in participantes_disponiveis if p.get('categoria') == categoria_escolhida]
+        
+        # Caso não haja candidatos para a categoria escolhida, tentamos recuperar a elegibilidade geral
+        if not candidatos_categoria:
+            # Se todos já foram sorteados anteriormente, limpamos para permitir nova rodada de pessoas
+            if len(participantes_disponiveis) == 0:
+                self.participantes_sorteados_ids.clear()
+                participantes_disponiveis = list(self.participantes)
+                candidatos_categoria = [p for p in participantes_disponiveis if p.get('categoria') == categoria_escolhida]
+            
+            # Se ainda assim não houver ninguém nessa categoria (ex.: categoria inexistente na planilha),
+            # realizamos um fallback para qualquer participante disponível para não travar o sorteio.
+            # Risco: isso pode quebrar a distribuição desejada. Sugestão: validar categorias com a planilha antes do evento.
+            if not candidatos_categoria:
+                # Fallback controlado: escolhe de todos disponíveis (mantido para robustez)
+                candidatos_categoria = list(participantes_disponiveis)
+
+        if not candidatos_categoria:
+            # Se ainda assim não houver candidatos, retorna None (situação anômala)
+            return None
+        
+        sorteado = random.choice(candidatos_categoria)
         self.participantes_sorteados_ids.add(sorteado['id'])
         
         return sorteado
@@ -567,17 +637,36 @@ class Sorteador:
                 nome_surf = self.criar_texto_responsivo(nome, max_largura_nome)
                 nome_rect = nome_surf.get_rect(center=(largura_tela//2, area_y + area_altura//2))
                 tela.blit(nome_surf, nome_rect)
+
+                # NOVO: Exibir a categoria logo abaixo do nome, centralizada e 80% menor que o texto do nome
+                # Comentários (PT-BR):
+                # - Ajustamos dinamicamente o tamanho com base no tamanho real renderizado do nome.
+                # - Risco: em telas muito pequenas, o tamanho pode ficar pequeno demais; considerar limite mínimo.
+                categoria = str(self.participante_sorteado.get('categoria', '')).strip()
+                if categoria:
+                    # Calcula tamanho da fonte da categoria como 20% do tamanho do nome (80% menor)
+                    # Derivamos o tamanho aproximado do nome pelo menor lado do glyph box; fallback para 48.
+                    try:
+                        # Heurística: estimar tamanho base a partir da altura do surface do nome
+                        tamanho_nome_px = nome_surf.get_height()
+                        tamanho_categoria = max(12, int(tamanho_nome_px * 0.20))  # mínimo de 12px
+                    except Exception:
+                        tamanho_categoria = 12
+
+                    fonte_categoria = pygame.font.SysFont('arial', tamanho_categoria, bold=False)
+                    categoria_surf = fonte_categoria.render(categoria, True, COR_CATEGORIA)
+                    categoria_rect = categoria_surf.get_rect(center=(largura_tela//2, nome_rect.bottom + 20))
+                    tela.blit(categoria_surf, categoria_rect)
                 
         else:
             mensagem = fonte_grande.render("PRONTO PARA SORTEAR!", True, (180, 200, 255))
             tela.blit(mensagem, (largura_tela//2 - mensagem.get_width()//2, area_y + area_altura//2 - 50))
             
-            instrucao = fonte_normal.render("Clique em 'INICIAR SORTEIO' para começar", True, (150, 180, 220))
+            instrucao = fonte_normal.render("Clique em 'SORTEAR' para começar", True, (150, 180, 220))
             tela.blit(instrucao, (largura_tela//2 - instrucao.get_width()//2, area_y + area_altura//2 + 30))
         
         # BOTÕES (mais para cima, sem a barra)
         self.botao_sortear.desenhar(tela)
-        self.botao_novo.desenhar(tela)
         
         # Estatísticas (mais para cima, sem a barra)
         stats_y = altura_tela - 120  # Subiu 40px
@@ -681,16 +770,9 @@ while executando:
         elif evento.type == pygame.MOUSEBUTTONDOWN:
             if sorteador.botao_sortear.verificar_clique(mouse_pos) and not sorteador.sorteando:
                 sorteador.iniciar_sorteio()
-            
-            elif sorteador.botao_novo.verificar_clique(mouse_pos):
-                sorteador.sorteando = False
-                sorteador.participante_sorteado = None
-                mixer.stop()
-                print("Novo sorteio pronto")
     
     # Atualiza hover dos botões
     sorteador.botao_sortear.verificar_hover(mouse_pos)
-    sorteador.botao_novo.verificar_hover(mouse_pos)
     
     # Atualiza lógica do sorteador
     sorteador.atualizar()
